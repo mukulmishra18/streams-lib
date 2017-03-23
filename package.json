@@ -1,0 +1,22 @@
+{
+  "name": "streams-lib",
+  "version": "1.0.0",
+  "description": "Streams API polyfill for PDF.js project.",
+  "main": "streams.lib.entry.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mukulmishra18/streams-lib.git"
+  },
+  "author": "mukulmishra18",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/mukulmishra18/streams-lib/issues"
+  },
+  "homepage": "https://github.com/mukulmishra18/streams-lib#readme",
+  "devDependencies": {
+    "webpack": "^2.3.1"
+  }
+}
