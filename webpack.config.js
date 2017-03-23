@@ -3,7 +3,9 @@ var webpack = require('webpack');
 module.exports = {
   entry: ['./streams.lib.entry.js'],
   output: {
-    filename: 'streams.lib.bundle.js'
+    filename: 'streams.lib.bundle.js',
+    libraryTarget: 'umd',
+    library: 'streams-lib'
   },
   // plugins: [
   //   new webpack.optimize.UglifyJsPlugin({
