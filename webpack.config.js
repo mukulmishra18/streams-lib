@@ -7,12 +7,19 @@ module.exports = {
     libraryTarget: 'umd',
     library: 'streams-lib'
   },
-  // plugins: [
-  //   new webpack.optimize.UglifyJsPlugin({
-  //     compressor: {
-  //       screw_ie8: true,
-  //       warnings: false
-  //     }
-  //   })
-  // ]
+  module: {
+    loaders: [
+      {
+        test: /\.js$/,
+        exclude: /node_modules/,
+        loader: 'babel-loader',
+        query: {
+          presets: ['es2015']
+        }
+      }
+    ]
+  },
+  resolve: {
+    extensions: [' ', '.js']
+  }
 };
