@@ -1,0 +1,13 @@
+language: node_js
+node_js:
+  - node
+cache:
+  directories:
+    - node_modules
+install:
+  - npm install -g npm@latest
+  - npm install
+before_script:
+  webpack
+script:
+  ./node_modules/.bin/jasmine ./test/unit/readable-stream-spec.js
