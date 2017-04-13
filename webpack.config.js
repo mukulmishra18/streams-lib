@@ -4,8 +4,7 @@ module.exports = {
   entry: ['./streams.lib.entry.js'],
   output: {
     filename: 'streams.lib.bundle.js',
-    libraryTarget: 'umd',
-    library: 'streams-lib'
+    libraryTarget: 'commonjs'
   },
   module: {
     loaders: [
