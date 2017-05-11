@@ -1,6 +1,6 @@
 'use strict';
-const assert = require('assert');
 const { IsFiniteNonNegativeNumber } = require('./helpers.js');
+const { assert } = require('./utils.js');
 
 exports.DequeueValue = container => {
   assert('_queue' in container && '_queueTotalSize' in container,

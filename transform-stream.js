@@ -1,5 +1,5 @@
 'use strict';
-const assert = require('assert');
+const { assert } = require('./utils.js');
 const { InvokeOrNoop, PromiseInvokeOrPerformFallback, PromiseInvokeOrNoop, typeIsObject } = require('./helpers.js');
 const { ReadableStream, ReadableStreamDefaultControllerClose,
         ReadableStreamDefaultControllerEnqueue, ReadableStreamDefaultControllerError,

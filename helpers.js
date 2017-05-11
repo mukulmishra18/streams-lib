@@ -1,5 +1,5 @@
 'use strict';
-const assert = require('assert');
+const { assert } = require('./utils.js');
 
 function IsPropertyKey(argument) {
   return typeof argument === 'string' || typeof argument === 'symbol';
@@ -90,7 +90,7 @@ exports.PromiseInvokeOrPerformFallback = (O, P, args, F, argsF) => {
   }
 
   if (method === undefined) {
-    return F(...argsF);
+    return F.apply(null, argsF);
   }
 
   try {
