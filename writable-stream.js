@@ -5,9 +5,16 @@ const { InvokeOrNoop, PromiseInvokeOrNoop, ValidateAndNormalizeQueuingStrategy, 
 const { rethrowAssertionErrorRejection } = require('./utils.js');
 const { DequeueValue, EnqueueValueWithSize, PeekQueueValue, ResetQueue } = require('./queue-with-sizes.js');
 
+const StartSteps = Symbol('[[StartSteps]]');
+const AbortSteps = Symbol('[[AbortSteps]]');
+const ErrorSteps = Symbol('[[ErrorSteps]]');
+
 class WritableStream {
   constructor(underlyingSink = {}, { size, highWaterMark = 1 } = {}) {
     this._state = 'writable';
+
+    // The error that will be reported by new method calls once the state becomes errored. Only set when [[state]] is
+    // 'erroring' or 'errored'. May be set to an undefined value.
     this._storedError = undefined;
 
     this._writer = undefined;
@@ -21,15 +28,22 @@ class WritableStream {
     this._writeRequests = [];
 
     // Write requests are removed from _writeRequests when write() is called on the underlying sink. This prevents
-    // them from being erroneously rejected on error. If a write() call is pending, the request is stored here.
-    this._pendingWriteRequest = undefined;
+    // them from being erroneously rejected on error. If a write() call is in-flight, the request is stored here.
+    this._inFlightWriteRequest = undefined;
 
     // The promise that was returned from writer.close(). Stored here because it may be fulfilled after the writer
     // has been detached.
-    this._pendingCloseRequest = undefined;
+    this._closeRequest = undefined;
+
+    // Close request is removed from _closeRequest when close() is called on the underlying sink. This prevents it
+    // from being erroneously rejected on error. If a close() call is in-flight, the request is stored here.
+    this._inFlightCloseRequest = undefined;
 
     // The promise that was returned from writer.abort(). This may also be fulfilled after the writer has detached.
     this._pendingAbortRequest = undefined;
+
+    // The backpressure signal set by the controller.
+    this._backpressure = false;
 
     const type = underlyingSink.type;
 
@@ -38,6 +52,7 @@ class WritableStream {
     }
 
     this._writableStreamController = new WritableStreamDefaultController(this, underlyingSink, size, highWaterMark);
+    this._writableStreamController[StartSteps]();
   }
 
   get locked() {
@@ -78,7 +93,8 @@ module.exports = {
   WritableStreamDefaultControllerError,
   WritableStreamDefaultWriterCloseWithErrorPropagation,
   WritableStreamDefaultWriterRelease,
-  WritableStreamDefaultWriterWrite
+  WritableStreamDefaultWriterWrite,
+  WritableStreamCloseQueuedOrInFlight
 };
 
 // Abstract operations for the WritableStream.
@@ -117,51 +133,34 @@ function WritableStreamAbort(stream, reason) {
   if (state === 'errored') {
     return Promise.reject(stream._storedError);
   }
-  const error = new TypeError('Aborted');
+  const error = new TypeError('Requested to abort');
   if (stream._pendingAbortRequest !== undefined) {
     return Promise.reject(error);
   }
 
-  assert(state === 'writable' || state === 'closing', 'state must be writable or closing');
+  assert(state === 'writable' || state === 'erroring', 'state must be writable or erroring');
 
-  const controller = stream._writableStreamController;
-  assert(controller !== undefined, 'controller must not be undefined');
-
-  let readyPromiseIsPending = false;
-  if (state === 'writable' &&
-      WritableStreamDefaultControllerGetBackpressure(stream._writableStreamController) === true) {
-    readyPromiseIsPending = true;
-  }
-
-  if (controller._writing === false && controller._inClose === false) {
-    if (stream._writer !== undefined) {
-      WritableStreamDefaultWriterEnsureReadyPromiseRejectedWith(
-          stream._writer, error, readyPromiseIsPending);
-    }
-    WritableStreamFinishAbort(stream);
-    return WritableStreamDefaultControllerAbort(controller, reason);
+  let wasAlreadyErroring = false;
+  if (state === 'erroring') {
+    wasAlreadyErroring = true;
+    // reason will not be used, so don't keep a reference to it.
+    reason = undefined;
   }
 
   const promise = new Promise((resolve, reject) => {
     stream._pendingAbortRequest = {
       _resolve: resolve,
       _reject: reject,
-      _reason: reason
+      _reason: reason,
+      _wasAlreadyErroring: wasAlreadyErroring
     };
   });
 
-  if (stream._writer !== undefined) {
-    WritableStreamDefaultWriterEnsureReadyPromiseRejectedWith(stream._writer, error, readyPromiseIsPending);
+  if (wasAlreadyErroring === false) {
+    WritableStreamStartErroring(stream, error);
   }
 
   return promise;
-}
-
-function WritableStreamFinishAbort(stream) {
-  stream._state = 'errored';
-  stream._storedError = new TypeError('Aborted');
-
-  WritableStreamRejectPromisesInReactionToError(stream);
 }
 
 // WritableStream API exposed for controllers.
@@ -182,185 +181,43 @@ function WritableStreamAddWriteRequest(stream) {
   return promise;
 }
 
-function WritableStreamFinishPendingWrite(stream) {
-  assert(stream._pendingWriteRequest !== undefined);
-  stream._pendingWriteRequest._resolve(undefined);
-  stream._pendingWriteRequest = undefined;
-
+function WritableStreamDealWithRejection(stream, error) {
   const state = stream._state;
 
-  let wasAborted = false;
-  if (stream._pendingAbortRequest !== undefined) {
-    wasAborted = true;
-  }
-
-  if (state === 'errored') {
-    if (wasAborted === true) {
-      stream._pendingAbortRequest._reject(stream._storedError);
-      stream._pendingAbortRequest = undefined;
-    }
-
-    WritableStreamRejectPromisesInReactionToError(stream);
-
+  if (state === 'writable') {
+    WritableStreamStartErroring(stream, error);
     return;
   }
+
+  assert(state === 'erroring');
+  WritableStreamFinishErroring(stream);
+}
+
+function WritableStreamStartErroring(stream, reason) {
+  assert(stream._storedError === undefined, 'stream._storedError === undefined');
+  assert(stream._state === 'writable', 'state must be writable');
 
   const controller = stream._writableStreamController;
+  assert(controller !== undefined, 'controller must not be undefined');
 
-  if (wasAborted === false) {
-    return;
-  }
-
-  WritableStreamFinishAbort(stream, state);
-
-  const abortRequest = stream._pendingAbortRequest;
-  stream._pendingAbortRequest = undefined;
-  const promise = WritableStreamDefaultControllerAbort(controller, abortRequest._reason);
-  promise.then(
-    abortRequest._resolve,
-    abortRequest._reject
-  );
-}
-
-function WritableStreamFinishPendingWriteWithError(stream, reason) {
-  assert(stream._pendingWriteRequest !== undefined);
-  stream._pendingWriteRequest._reject(reason);
-  stream._pendingWriteRequest = undefined;
-
-  const state = stream._state;
-
-  let wasAborted = false;
-  if (stream._pendingAbortRequest !== undefined) {
-    wasAborted = true;
-  }
-
-  let readyPromiseIsPending = false;
-  if (state === 'writable' && wasAborted === false &&
-      WritableStreamDefaultControllerGetBackpressure(stream._writableStreamController) === true) {
-    readyPromiseIsPending = true;
-  }
-
-  if (wasAborted === true) {
-    stream._pendingAbortRequest._reject(reason);
-    stream._pendingAbortRequest = undefined;
-  }
-
-  if (state === 'errored') {
-    WritableStreamRejectPromisesInReactionToError(stream);
-
-    return;
-  }
-
-  stream._state = 'errored';
+  stream._state = 'erroring';
   stream._storedError = reason;
-
-  if (wasAborted === false && stream._writer !== undefined) {
-    WritableStreamDefaultWriterEnsureReadyPromiseRejectedWith(stream._writer, reason, readyPromiseIsPending);
-  }
-
-  WritableStreamRejectPromisesInReactionToError(stream);
-}
-
-function WritableStreamFinishPendingClose(stream) {
-  assert(stream._pendingCloseRequest !== undefined);
-  stream._pendingCloseRequest._resolve(undefined);
-  stream._pendingCloseRequest = undefined;
-
-  const state = stream._state;
-
-  let wasAborted = false;
-  if (stream._pendingAbortRequest !== undefined) {
-    wasAborted = true;
-  }
-
-  if (state === 'errored') {
-    if (wasAborted === true) {
-      stream._pendingAbortRequest._reject(stream._storedError);
-      stream._pendingAbortRequest = undefined;
-    }
-
-    WritableStreamRejectClosedPromiseIfAny(stream);
-
-    return;
-  }
-
-  assert(state === 'closing');
-
-  if (wasAborted === false) {
-    const writer = stream._writer;
-    if (writer !== undefined) {
-      defaultWriterClosedPromiseResolve(writer);
-    }
-    stream._state = 'closed';
-    return;
-  }
-
-  stream._pendingAbortRequest._resolve();
-  stream._pendingAbortRequest = undefined;
-
-  stream._state = 'errored';
-  stream._storedError = new TypeError('Abort requested but closed successfully');
-
-  WritableStreamRejectClosedPromiseIfAny(stream);
-}
-
-function WritableStreamFinishPendingCloseWithError(stream, reason) {
-  assert(stream._pendingCloseRequest !== undefined);
-  stream._pendingCloseRequest._reject(reason);
-  stream._pendingCloseRequest = undefined;
-
-  const state = stream._state;
-
-  let wasAborted = false;
-  if (stream._pendingAbortRequest !== undefined) {
-    wasAborted = true;
-  }
-
-  let readyPromiseIsPending = false;
-  if (state === 'writable' && wasAborted === false &&
-      WritableStreamDefaultControllerGetBackpressure(stream._writableStreamController) === true) {
-    readyPromiseIsPending = true;
-  }
-
-  if (wasAborted === true) {
-    stream._pendingAbortRequest._reject(reason);
-    stream._pendingAbortRequest = undefined;
-  }
-
-  if (state === 'errored') {
-    WritableStreamRejectClosedPromiseIfAny(stream);
-
-    return;
-  }
-
-  assert(state === 'closing');
-
-  stream._state = 'errored';
-  stream._storedError = reason;
-
-  if (wasAborted === false && stream._writer !== undefined) {
-    WritableStreamDefaultWriterEnsureReadyPromiseRejectedWith(stream._writer, reason, readyPromiseIsPending);
-  }
-
-  WritableStreamRejectClosedPromiseIfAny(stream);
-}
-
-function WritableStreamMarkFirstWriteRequestPending(stream) {
-  assert(stream._pendingWriteRequest === undefined, 'there must be no pending write request');
-  assert(stream._writeRequests.length !== 0, 'writeRequests must not be empty');
-  stream._pendingWriteRequest = stream._writeRequests.shift();
-}
-
-function WritableStreamRejectClosedPromiseIfAny(stream) {
   const writer = stream._writer;
   if (writer !== undefined) {
-    defaultWriterClosedPromiseReject(writer, stream._storedError);
-    writer._closedPromise.catch(() => {});
+    WritableStreamDefaultWriterEnsureReadyPromiseRejected(writer, reason);
+  }
+
+  if (WritableStreamHasOperationMarkedInFlight(stream) === false && controller._started === true) {
+    WritableStreamFinishErroring(stream);
   }
 }
 
-function WritableStreamRejectPromisesInReactionToError(stream) {
-  assert(stream._state === 'errored');
+function WritableStreamFinishErroring(stream) {
+  assert(stream._state === 'erroring', 'stream._state === erroring');
+  assert(WritableStreamHasOperationMarkedInFlight(stream) === false,
+         'WritableStreamHasOperationMarkedInFlight(stream) === false');
+  stream._state = 'errored';
+  stream._writableStreamController[ErrorSteps]();
 
   const storedError = stream._storedError;
   for (const writeRequest of stream._writeRequests) {
@@ -368,29 +225,153 @@ function WritableStreamRejectPromisesInReactionToError(stream) {
   }
   stream._writeRequests = [];
 
-  if (stream._pendingCloseRequest !== undefined) {
-    assert(stream._writableStreamController._inClose === false);
-    stream._pendingCloseRequest._reject(storedError);
-    stream._pendingCloseRequest = undefined;
+  if (stream._pendingAbortRequest === undefined) {
+    WritableStreamRejectCloseAndClosedPromiseIfNeeded(stream);
+    return;
   }
 
-  WritableStreamRejectClosedPromiseIfAny(stream);
+  const abortRequest = stream._pendingAbortRequest;
+  stream._pendingAbortRequest = undefined;
+
+  if (abortRequest._wasAlreadyErroring === true) {
+    abortRequest._reject(storedError);
+    WritableStreamRejectCloseAndClosedPromiseIfNeeded(stream);
+    return;
+  }
+
+  const promise = stream._writableStreamController[AbortSteps](abortRequest._reason);
+  promise.then(
+      () => {
+        abortRequest._resolve();
+        WritableStreamRejectCloseAndClosedPromiseIfNeeded(stream);
+      },
+      reason => {
+        abortRequest._reject(reason);
+        WritableStreamRejectCloseAndClosedPromiseIfNeeded(stream);
+      });
+}
+
+function WritableStreamFinishInFlightWrite(stream) {
+  assert(stream._inFlightWriteRequest !== undefined);
+  stream._inFlightWriteRequest._resolve(undefined);
+  stream._inFlightWriteRequest = undefined;
+}
+
+function WritableStreamFinishInFlightWriteWithError(stream, error) {
+  assert(stream._inFlightWriteRequest !== undefined);
+  stream._inFlightWriteRequest._reject(error);
+  stream._inFlightWriteRequest = undefined;
+
+  assert(stream._state === 'writable' || stream._state === 'erroring');
+
+  WritableStreamDealWithRejection(stream, error);
+}
+
+function WritableStreamFinishInFlightClose(stream) {
+  assert(stream._inFlightCloseRequest !== undefined);
+  stream._inFlightCloseRequest._resolve(undefined);
+  stream._inFlightCloseRequest = undefined;
+
+  const state = stream._state;
+
+  assert(state === 'writable' || state === 'erroring');
+
+  if (state === 'erroring') {
+    // The error was too late to do anything, so it is ignored.
+    stream._storedError = undefined;
+    if (stream._pendingAbortRequest !== undefined) {
+      stream._pendingAbortRequest._resolve();
+      stream._pendingAbortRequest = undefined;
+    }
+  }
+
+  stream._state = 'closed';
+
+  const writer = stream._writer;
+  if (writer !== undefined) {
+    defaultWriterClosedPromiseResolve(writer);
+  }
+
+  assert(stream._pendingAbortRequest === undefined, 'stream._pendingAbortRequest === undefined');
+  assert(stream._storedError === undefined, 'stream._storedError === undefined');
+}
+
+function WritableStreamFinishInFlightCloseWithError(stream, error) {
+  assert(stream._inFlightCloseRequest !== undefined);
+  stream._inFlightCloseRequest._reject(error);
+  stream._inFlightCloseRequest = undefined;
+
+  assert(stream._state === 'writable' || stream._state === 'erroring');
+
+  // Never execute sink abort() after sink close().
+  if (stream._pendingAbortRequest !== undefined) {
+    stream._pendingAbortRequest._reject(error);
+    stream._pendingAbortRequest = undefined;
+  }
+  WritableStreamDealWithRejection(stream, error);
+}
+
+// TODO(ricea): Fix alphabetical order.
+function WritableStreamCloseQueuedOrInFlight(stream) {
+  if (stream._closeRequest === undefined && stream._inFlightCloseRequest === undefined) {
+    return false;
+  }
+
+  return true;
+}
+
+function WritableStreamHasOperationMarkedInFlight(stream) {
+  if (stream._inFlightWriteRequest === undefined && stream._inFlightCloseRequest === undefined) {
+    return false;
+  }
+
+  return true;
+}
+
+function WritableStreamMarkCloseRequestInFlight(stream) {
+  assert(stream._inFlightCloseRequest === undefined);
+  assert(stream._closeRequest !== undefined);
+  stream._inFlightCloseRequest = stream._closeRequest;
+  stream._closeRequest = undefined;
+}
+
+function WritableStreamMarkFirstWriteRequestInFlight(stream) {
+  assert(stream._inFlightWriteRequest === undefined, 'there must be no pending write request');
+  assert(stream._writeRequests.length !== 0, 'writeRequests must not be empty');
+  stream._inFlightWriteRequest = stream._writeRequests.shift();
+}
+
+function WritableStreamRejectCloseAndClosedPromiseIfNeeded(stream) {
+  assert(stream._state === 'errored', '_stream_.[[state]] is `"errored"`');
+  if (stream._closeRequest !== undefined) {
+    assert(stream._inFlightCloseRequest === undefined);
+
+    stream._closeRequest._reject(stream._storedError);
+    stream._closeRequest = undefined;
+  }
+  const writer = stream._writer;
+  if (writer !== undefined) {
+    defaultWriterClosedPromiseReject(writer, stream._storedError);
+    writer._closedPromise.catch(() => {});
+  }
 }
 
 function WritableStreamUpdateBackpressure(stream, backpressure) {
   assert(stream._state === 'writable');
+  assert(WritableStreamCloseQueuedOrInFlight(stream) === false);
 
   const writer = stream._writer;
-  if (writer === undefined) {
-    return;
+  if (writer !== undefined && backpressure !== stream._backpressure) {
+    if (backpressure === true) {
+      defaultWriterReadyPromiseReset(writer);
+    } else {
+      assert(backpressure === false);
+
+      defaultWriterReadyPromiseResolve(writer);
+    }
   }
 
-  if (backpressure === true) {
-    defaultWriterReadyPromiseReset(writer);
-  } else {
-    assert(backpressure === false);
-    defaultWriterReadyPromiseResolve(writer);
-  }
+  stream._backpressure = backpressure;
 }
 
 class WritableStreamDefaultWriter {
@@ -407,22 +388,29 @@ class WritableStreamDefaultWriter {
 
     const state = stream._state;
 
-    if (state === 'writable' || state === 'closing') {
+    if (state === 'writable') {
+      if (WritableStreamCloseQueuedOrInFlight(stream) === false && stream._backpressure === true) {
+        defaultWriterReadyPromiseInitialize(this);
+      } else {
+        defaultWriterReadyPromiseInitializeAsResolved(this);
+      }
+
+      defaultWriterClosedPromiseInitialize(this);
+    } else if (state === 'erroring') {
+      defaultWriterReadyPromiseInitializeAsRejected(this, stream._storedError);
+      this._readyPromise.catch(() => {});
       defaultWriterClosedPromiseInitialize(this);
     } else if (state === 'closed') {
+      defaultWriterReadyPromiseInitializeAsResolved(this);
       defaultWriterClosedPromiseInitializeAsResolved(this);
     } else {
       assert(state === 'errored', 'state must be errored');
 
-      defaultWriterClosedPromiseInitializeAsRejected(this, stream._storedError);
+      const storedError = stream._storedError;
+      defaultWriterReadyPromiseInitializeAsRejected(this, storedError);
+      this._readyPromise.catch(() => {});
+      defaultWriterClosedPromiseInitializeAsRejected(this, storedError);
       this._closedPromise.catch(() => {});
-    }
-
-    if (state === 'writable' &&
-        WritableStreamDefaultControllerGetBackpressure(stream._writableStreamController) === true) {
-      defaultWriterReadyPromiseInitialize(this);
-    } else {
-      defaultWriterReadyPromiseInitializeAsResolved(this, undefined);
     }
   }
 
@@ -477,7 +465,7 @@ class WritableStreamDefaultWriter {
       return Promise.reject(defaultWriterLockException('close'));
     }
 
-    if (stream._state === 'closing') {
+    if (WritableStreamCloseQueuedOrInFlight(stream) === true) {
       return Promise.reject(new TypeError('cannot close an already-closing stream'));
     }
 
@@ -505,14 +493,8 @@ class WritableStreamDefaultWriter {
       return Promise.reject(defaultWriterBrandCheckException('write'));
     }
 
-    const stream = this._ownerWritableStream;
-
-    if (stream === undefined) {
+    if (this._ownerWritableStream === undefined) {
       return Promise.reject(defaultWriterLockException('write to'));
-    }
-
-    if (stream._state === 'closing') {
-      return Promise.reject(new TypeError('Cannot write to an already-closed stream'));
     }
 
     return WritableStreamDefaultWriterWrite(this, chunk);
@@ -553,11 +535,9 @@ function WritableStreamDefaultWriterClose(writer) {
     return Promise.reject(new TypeError(
       `The stream (in ${state} state) is not in the writable state and cannot be closed`));
   }
-  if (stream._pendingAbortRequest !== undefined) {
-    return Promise.reject(new TypeError('Aborted'));
-  }
 
-  assert(state === 'writable');
+  assert(state === 'writable' || state === 'erroring');
+  assert(WritableStreamCloseQueuedOrInFlight(stream) === false);
 
   const promise = new Promise((resolve, reject) => {
     const closeRequest = {
@@ -565,14 +545,12 @@ function WritableStreamDefaultWriterClose(writer) {
       _reject: reject
     };
 
-    stream._pendingCloseRequest = closeRequest;
+    stream._closeRequest = closeRequest;
   });
 
-  if (WritableStreamDefaultControllerGetBackpressure(stream._writableStreamController) === true) {
+  if (stream._backpressure === true && state === 'writable') {
     defaultWriterReadyPromiseResolve(writer);
   }
-
-  stream._state = 'closing';
 
   WritableStreamDefaultControllerClose(stream._writableStreamController);
 
@@ -586,7 +564,7 @@ function WritableStreamDefaultWriterCloseWithErrorPropagation(writer) {
   assert(stream !== undefined);
 
   const state = stream._state;
-  if (state === 'closing' || state === 'closed') {
+  if (WritableStreamCloseQueuedOrInFlight(stream) === true || state === 'closed') {
     return Promise.resolve();
   }
 
@@ -594,13 +572,22 @@ function WritableStreamDefaultWriterCloseWithErrorPropagation(writer) {
     return Promise.reject(stream._storedError);
   }
 
-  assert(state === 'writable');
+  assert(state === 'writable' || state === 'erroring');
 
   return WritableStreamDefaultWriterClose(writer);
 }
 
-function WritableStreamDefaultWriterEnsureReadyPromiseRejectedWith(writer, error, isPending) {
-  if (isPending === true) {
+function WritableStreamDefaultWriterEnsureClosedPromiseRejected(writer, error) {
+  if (writer._closedPromiseState === 'pending') {
+    defaultWriterClosedPromiseReject(writer, error);
+  } else {
+    defaultWriterClosedPromiseResetToRejected(writer, error);
+  }
+  writer._closedPromise.catch(() => {});
+}
+
+function WritableStreamDefaultWriterEnsureReadyPromiseRejected(writer, error) {
+  if (writer._readyPromiseState === 'pending') {
     defaultWriterReadyPromiseReject(writer, error);
   } else {
     defaultWriterReadyPromiseResetToRejected(writer, error);
@@ -612,7 +599,7 @@ function WritableStreamDefaultWriterGetDesiredSize(writer) {
   const stream = writer._ownerWritableStream;
   const state = stream._state;
 
-  if (state === 'errored' || stream._pendingAbortRequest !== undefined) {
+  if (state === 'errored' || state === 'erroring') {
     return null;
   }
 
@@ -630,22 +617,12 @@ function WritableStreamDefaultWriterRelease(writer) {
 
   const releasedError = new TypeError(
     'Writer was released and can no longer be used to monitor the stream\'s closedness');
-  const state = stream._state;
 
-  const controller = stream._writableStreamController;
-  if (state === 'writable' || state === 'closing' || controller._inClose === true || controller._writing === true) {
-    defaultWriterClosedPromiseReject(writer, releasedError);
-  } else {
-    defaultWriterClosedPromiseResetToRejected(writer, releasedError);
-  }
-  writer._closedPromise.catch(() => {});
+  WritableStreamDefaultWriterEnsureReadyPromiseRejected(writer, releasedError);
 
-  let readyPromiseIsPending = false;
-  if (state === 'writable' && stream._pendingAbortRequest === undefined &&
-      WritableStreamDefaultControllerGetBackpressure(stream._writableStreamController) === true) {
-    readyPromiseIsPending = true;
-  }
-  WritableStreamDefaultWriterEnsureReadyPromiseRejectedWith(writer, releasedError, readyPromiseIsPending);
+  // The state transitions to "errored" before the sink abort() method runs, but the writer.closed promise is not
+  // rejected until afterwards. This means that simply testing state will not work.
+  WritableStreamDefaultWriterEnsureClosedPromiseRejected(writer, releasedError);
 
   stream._writer = undefined;
   writer._ownerWritableStream = undefined;
@@ -656,20 +633,30 @@ function WritableStreamDefaultWriterWrite(writer, chunk) {
 
   assert(stream !== undefined);
 
-  const state = stream._state;
-  if (state === 'closed' || state === 'errored') {
-    return Promise.reject(new TypeError(
-      `The stream (in ${state} state) is not in the writable state and cannot be written to`));
+  const controller = stream._writableStreamController;
+
+  const chunkSize = WritableStreamDefaultControllerGetChunkSize(controller, chunk);
+
+  if (stream !== writer._ownerWritableStream) {
+    return Promise.reject(defaultWriterLockException('write to'));
   }
-  if (stream._pendingAbortRequest !== undefined) {
-    return Promise.reject(new TypeError('Aborted'));
+
+  const state = stream._state;
+  if (state === 'errored') {
+    return Promise.reject(stream._storedError);
+  }
+  if (WritableStreamCloseQueuedOrInFlight(stream) === true || state === 'closed') {
+    return Promise.reject(new TypeError('The stream is closing or closed and cannot be written to'));
+  }
+  if (state === 'erroring') {
+    return Promise.reject(stream._storedError);
   }
 
   assert(state === 'writable');
 
   const promise = WritableStreamAddWriteRequest(stream);
 
-  WritableStreamDefaultControllerWrite(stream._writableStreamController, chunk);
+  WritableStreamDefaultControllerWrite(controller, chunk, chunkSize);
 
   return promise;
 }
@@ -695,31 +682,13 @@ class WritableStreamDefaultController {
     ResetQueue(this);
 
     this._started = false;
-    this._writing = false;
-    this._inClose = false;
 
     const normalizedStrategy = ValidateAndNormalizeQueuingStrategy(size, highWaterMark);
     this._strategySize = normalizedStrategy.size;
     this._strategyHWM = normalizedStrategy.highWaterMark;
 
     const backpressure = WritableStreamDefaultControllerGetBackpressure(this);
-    if (backpressure === true) {
-      WritableStreamUpdateBackpressure(stream, backpressure);
-    }
-
-    const controller = this;
-
-    const startResult = InvokeOrNoop(underlyingSink, 'start', [this]);
-    Promise.resolve(startResult).then(
-      () => {
-        controller._started = true;
-        WritableStreamDefaultControllerAdvanceQueueIfNeeded(controller);
-      },
-      r => {
-        WritableStreamDefaultControllerErrorIfNeeded(controller, r);
-      }
-    )
-    .catch(rethrowAssertionErrorRejection);
+    WritableStreamUpdateBackpressure(stream, backpressure);
   }
 
   error(e) {
@@ -727,66 +696,72 @@ class WritableStreamDefaultController {
       throw new TypeError(
         'WritableStreamDefaultController.prototype.error can only be used on a WritableStreamDefaultController');
     }
-
     const state = this._controlledWritableStream._state;
-    if (state === 'closed' || state === 'errored') {
-      throw new TypeError(`The stream is ${state} and so cannot be errored`);
+    if (state !== 'writable') {
+      // The stream is closed, errored or will be soon. The sink can't do anything useful if it gets an error here, so
+      // just treat it as a no-op.
+      return;
     }
 
     WritableStreamDefaultControllerError(this, e);
   }
+
+  [AbortSteps](reason) {
+    return PromiseInvokeOrNoop(this._underlyingSink, 'abort', [reason]);
+  }
+
+  [ErrorSteps]() {
+    ResetQueue(this);
+  }
+
+  [StartSteps]() {
+    const startResult = InvokeOrNoop(this._underlyingSink, 'start', [this]);
+    const stream = this._controlledWritableStream;
+
+    Promise.resolve(startResult).then(
+      () => {
+        assert(stream._state === 'writable' || stream._state === 'erroring');
+        this._started = true;
+        WritableStreamDefaultControllerAdvanceQueueIfNeeded(this);
+      },
+      r => {
+        assert(stream._state === 'writable' || stream._state === 'erroring');
+        this._started = true;
+        WritableStreamDealWithRejection(stream, r);
+      }
+    )
+    .catch(rethrowAssertionErrorRejection);
+  }
 }
 
 // Abstract operations implementing interface required by the WritableStream.
-
-function WritableStreamDefaultControllerAbort(controller, reason) {
-  ResetQueue(controller);
-  const sinkAbortPromise = PromiseInvokeOrNoop(controller._underlyingSink, 'abort', [reason]);
-  return sinkAbortPromise.then(() => undefined);
-}
 
 function WritableStreamDefaultControllerClose(controller) {
   EnqueueValueWithSize(controller, 'close', 0);
   WritableStreamDefaultControllerAdvanceQueueIfNeeded(controller);
 }
 
+function WritableStreamDefaultControllerGetChunkSize(controller, chunk) {
+  const strategySize = controller._strategySize;
+
+  if (strategySize === undefined) {
+    return 1;
+  }
+
+  try {
+    return strategySize(chunk);
+  } catch (chunkSizeE) {
+    WritableStreamDefaultControllerErrorIfNeeded(controller, chunkSizeE);
+    return 1;
+  }
+}
+
 function WritableStreamDefaultControllerGetDesiredSize(controller) {
   return controller._strategyHWM - controller._queueTotalSize;
 }
 
-function WritableStreamDefaultControllerUpdateBackpressureIfNeeded(controller, oldBackpressure) {
-  const stream = controller._controlledWritableStream;
-  if (stream._state !== 'writable') {
-    return;
-  }
-
-  const backpressure = WritableStreamDefaultControllerGetBackpressure(controller);
-  if (oldBackpressure !== backpressure) {
-    WritableStreamUpdateBackpressure(stream, backpressure);
-  }
-}
-
-function WritableStreamDefaultControllerWrite(controller, chunk) {
-  const stream = controller._controlledWritableStream;
-
-  assert(stream._state === 'writable');
-
-  let chunkSize = 1;
-
-  if (controller._strategySize !== undefined) {
-    const strategySize = controller._strategySize;
-    try {
-      chunkSize = strategySize(chunk);
-    } catch (chunkSizeE) {
-      // TODO: Should we notify the sink of this error?
-      WritableStreamDefaultControllerErrorIfNeeded(controller, chunkSizeE);
-      return;
-    }
-  }
-
+function WritableStreamDefaultControllerWrite(controller, chunk, chunkSize) {
   const writeRecord = { chunk };
-
-  const oldBackpressure = WritableStreamDefaultControllerGetBackpressure(controller);
 
   try {
     EnqueueValueWithSize(controller, writeRecord, chunkSize);
@@ -795,7 +770,11 @@ function WritableStreamDefaultControllerWrite(controller, chunk) {
     return;
   }
 
-  WritableStreamDefaultControllerUpdateBackpressureIfNeeded(controller, oldBackpressure);
+  const stream = controller._controlledWritableStream;
+  if (WritableStreamCloseQueuedOrInFlight(stream) === false && stream._state === 'writable') {
+    const backpressure = WritableStreamDefaultControllerGetBackpressure(controller);
+    WritableStreamUpdateBackpressure(stream, backpressure);
+  }
 
   WritableStreamDefaultControllerAdvanceQueueIfNeeded(controller);
 }
@@ -815,16 +794,22 @@ function IsWritableStreamDefaultController(x) {
 }
 
 function WritableStreamDefaultControllerAdvanceQueueIfNeeded(controller) {
-  if (controller._controlledWritableStream._state === 'closed' ||
-      controller._controlledWritableStream._state === 'errored') {
-    return;
-  }
+  const stream = controller._controlledWritableStream;
 
   if (controller._started === false) {
     return;
   }
 
-  if (controller._writing === true) {
+  if (stream._inFlightWriteRequest !== undefined) {
+    return;
+  }
+
+  const state = stream._state;
+  if (state === 'closed' || state === 'errored') {
+    return;
+  }
+  if (state === 'erroring') {
+    WritableStreamFinishErroring(stream);
     return;
   }
 
@@ -840,81 +825,56 @@ function WritableStreamDefaultControllerAdvanceQueueIfNeeded(controller) {
   }
 }
 
-function WritableStreamDefaultControllerErrorIfNeeded(controller, e) {
-  if (controller._controlledWritableStream._state === 'writable' ||
-      controller._controlledWritableStream._state === 'closing') {
-    WritableStreamDefaultControllerError(controller, e);
+function WritableStreamDefaultControllerErrorIfNeeded(controller, error) {
+  if (controller._controlledWritableStream._state === 'writable') {
+    WritableStreamDefaultControllerError(controller, error);
   }
 }
 
 function WritableStreamDefaultControllerProcessClose(controller) {
   const stream = controller._controlledWritableStream;
 
-  assert(stream._state === 'closing', 'can\'t process final write record unless already closed');
+  WritableStreamMarkCloseRequestInFlight(stream);
 
   DequeueValue(controller);
   assert(controller._queue.length === 0, 'queue must be empty once the final write record is dequeued');
 
-  controller._inClose = true;
-  const sinkClosePromise = PromiseInvokeOrNoop(controller._underlyingSink, 'close', [controller]);
+  const sinkClosePromise = PromiseInvokeOrNoop(controller._underlyingSink, 'close', []);
   sinkClosePromise.then(
     () => {
-      assert(controller._inClose === true);
-      controller._inClose = false;
-      assert(stream._state === 'closing' || stream._state === 'errored');
-
-      WritableStreamFinishPendingClose(stream);
+      WritableStreamFinishInFlightClose(stream);
     },
     reason => {
-      assert(controller._inClose === true);
-      controller._inClose = false;
-
-      WritableStreamFinishPendingCloseWithError(stream, reason);
+      WritableStreamFinishInFlightCloseWithError(stream, reason);
     }
   )
   .catch(rethrowAssertionErrorRejection);
 }
 
 function WritableStreamDefaultControllerProcessWrite(controller, chunk) {
-  controller._writing = true;
-
   const stream = controller._controlledWritableStream;
 
-  WritableStreamMarkFirstWriteRequestPending(stream);
+  WritableStreamMarkFirstWriteRequestInFlight(stream);
 
   const sinkWritePromise = PromiseInvokeOrNoop(controller._underlyingSink, 'write', [chunk, controller]);
   sinkWritePromise.then(
     () => {
-      assert(controller._writing === true);
-      controller._writing = false;
-
-      WritableStreamFinishPendingWrite(stream);
+      WritableStreamFinishInFlightWrite(stream);
 
       const state = stream._state;
-      if (state === 'errored') {
-        return;
-      }
+      assert(state === 'writable' || state === 'erroring');
 
-      assert(state === 'closing' || state === 'writable');
-
-      const oldBackpressure = WritableStreamDefaultControllerGetBackpressure(controller);
       DequeueValue(controller);
-      WritableStreamDefaultControllerUpdateBackpressureIfNeeded(controller, oldBackpressure);
+
+      if (WritableStreamCloseQueuedOrInFlight(stream) === false && state === 'writable') {
+        const backpressure = WritableStreamDefaultControllerGetBackpressure(controller);
+        WritableStreamUpdateBackpressure(stream, backpressure);
+      }
 
       WritableStreamDefaultControllerAdvanceQueueIfNeeded(controller);
     },
     reason => {
-      assert(controller._writing === true);
-      controller._writing = false;
-
-      const wasErrored = stream._state === 'errored';
-
-      WritableStreamFinishPendingWriteWithError(stream, reason);
-
-      assert(stream._state === 'errored');
-      if (wasErrored === false) {
-        controller._queue = [];
-      }
+      WritableStreamFinishInFlightWriteWithError(stream, reason);
     }
   )
   .catch(rethrowAssertionErrorRejection);
@@ -927,30 +887,12 @@ function WritableStreamDefaultControllerGetBackpressure(controller) {
 
 // A client of WritableStreamDefaultController may use these functions directly to bypass state check.
 
-function WritableStreamDefaultControllerError(controller, e) {
+function WritableStreamDefaultControllerError(controller, error) {
   const stream = controller._controlledWritableStream;
 
-  assert(stream._state === 'writable' || stream._state === 'closing');
+  assert(stream._state === 'writable');
 
-  const oldState = stream._state;
-
-  stream._state = 'errored';
-  stream._storedError = e;
-
-  if (stream._pendingAbortRequest === undefined && stream._writer !== undefined) {
-    let readyPromiseIsPending = false;
-    if (oldState === 'writable' &&
-        WritableStreamDefaultControllerGetBackpressure(stream._writableStreamController) === true) {
-      readyPromiseIsPending = true;
-    }
-    WritableStreamDefaultWriterEnsureReadyPromiseRejectedWith(stream._writer, e, readyPromiseIsPending);
-  }
-
-  ResetQueue(controller);
-
-  if (controller._writing === false && controller._inClose === false) {
-    WritableStreamRejectPromisesInReactionToError(stream);
-  }
+  WritableStreamStartErroring(stream, error);
 }
 
 // Helper functions for the WritableStream.
@@ -974,6 +916,7 @@ function defaultWriterClosedPromiseInitialize(writer) {
   writer._closedPromise = new Promise((resolve, reject) => {
     writer._closedPromise_resolve = resolve;
     writer._closedPromise_reject = reject;
+    writer._closedPromiseState = 'pending';
   });
 }
 
@@ -981,37 +924,45 @@ function defaultWriterClosedPromiseInitializeAsRejected(writer, reason) {
   writer._closedPromise = Promise.reject(reason);
   writer._closedPromise_resolve = undefined;
   writer._closedPromise_reject = undefined;
+  writer._closedPromiseState = 'rejected';
 }
 
 function defaultWriterClosedPromiseInitializeAsResolved(writer) {
   writer._closedPromise = Promise.resolve(undefined);
   writer._closedPromise_resolve = undefined;
   writer._closedPromise_reject = undefined;
+  writer._closedPromiseState = 'resolved';
 }
 
 function defaultWriterClosedPromiseReject(writer, reason) {
-  assert(writer._closedPromise_resolve !== undefined);
-  assert(writer._closedPromise_reject !== undefined);
+  assert(writer._closedPromise_resolve !== undefined, 'writer._closedPromise_resolve !== undefined');
+  assert(writer._closedPromise_reject !== undefined, 'writer._closedPromise_reject !== undefined');
+  assert(writer._closedPromiseState === 'pending', 'writer._closedPromiseState is pending');
 
   writer._closedPromise_reject(reason);
   writer._closedPromise_resolve = undefined;
   writer._closedPromise_reject = undefined;
+  writer._closedPromiseState = 'rejected';
 }
 
 function defaultWriterClosedPromiseResetToRejected(writer, reason) {
-  assert(writer._closedPromise_resolve === undefined);
-  assert(writer._closedPromise_reject === undefined);
+  assert(writer._closedPromise_resolve === undefined, 'writer._closedPromise_resolve === undefined');
+  assert(writer._closedPromise_reject === undefined, 'writer._closedPromise_reject === undefined');
+  assert(writer._closedPromiseState !== 'pending', 'writer._closedPromiseState is not pending');
 
   writer._closedPromise = Promise.reject(reason);
+  writer._closedPromiseState = 'rejected';
 }
 
 function defaultWriterClosedPromiseResolve(writer) {
-  assert(writer._closedPromise_resolve !== undefined);
-  assert(writer._closedPromise_reject !== undefined);
+  assert(writer._closedPromise_resolve !== undefined, 'writer._closedPromise_resolve !== undefined');
+  assert(writer._closedPromise_reject !== undefined, 'writer._closedPromise_reject !== undefined');
+  assert(writer._closedPromiseState === 'pending', 'writer._closedPromiseState is pending');
 
   writer._closedPromise_resolve(undefined);
   writer._closedPromise_resolve = undefined;
   writer._closedPromise_reject = undefined;
+  writer._closedPromiseState = 'resolved';
 }
 
 function defaultWriterReadyPromiseInitialize(writer) {
@@ -1019,45 +970,58 @@ function defaultWriterReadyPromiseInitialize(writer) {
     writer._readyPromise_resolve = resolve;
     writer._readyPromise_reject = reject;
   });
+  writer._readyPromiseState = 'pending';
+}
+
+function defaultWriterReadyPromiseInitializeAsRejected(writer, reason) {
+  writer._readyPromise = Promise.reject(reason);
+  writer._readyPromise_resolve = undefined;
+  writer._readyPromise_reject = undefined;
+  writer._readyPromiseState = 'rejected';
 }
 
 function defaultWriterReadyPromiseInitializeAsResolved(writer) {
   writer._readyPromise = Promise.resolve(undefined);
   writer._readyPromise_resolve = undefined;
   writer._readyPromise_reject = undefined;
+  writer._readyPromiseState = 'fulfilled';
 }
 
 function defaultWriterReadyPromiseReject(writer, reason) {
-  assert(writer._readyPromise_resolve !== undefined);
-  assert(writer._readyPromise_reject !== undefined);
+  assert(writer._readyPromise_resolve !== undefined, 'writer._readyPromise_resolve !== undefined');
+  assert(writer._readyPromise_reject !== undefined, 'writer._readyPromise_reject !== undefined');
 
   writer._readyPromise_reject(reason);
   writer._readyPromise_resolve = undefined;
   writer._readyPromise_reject = undefined;
+  writer._readyPromiseState = 'rejected';
 }
 
 function defaultWriterReadyPromiseReset(writer) {
-  assert(writer._readyPromise_resolve === undefined);
-  assert(writer._readyPromise_reject === undefined);
+  assert(writer._readyPromise_resolve === undefined, 'writer._readyPromise_resolve === undefined');
+  assert(writer._readyPromise_reject === undefined, 'writer._readyPromise_reject === undefined');
 
   writer._readyPromise = new Promise((resolve, reject) => {
     writer._readyPromise_resolve = resolve;
     writer._readyPromise_reject = reject;
   });
+  writer._readyPromiseState = 'pending';
 }
 
 function defaultWriterReadyPromiseResetToRejected(writer, reason) {
-  assert(writer._readyPromise_resolve === undefined);
-  assert(writer._readyPromise_reject === undefined);
+  assert(writer._readyPromise_resolve === undefined, 'writer._readyPromise_resolve === undefined');
+  assert(writer._readyPromise_reject === undefined, 'writer._readyPromise_reject === undefined');
 
   writer._readyPromise = Promise.reject(reason);
+  writer._readyPromiseState = 'rejected';
 }
 
 function defaultWriterReadyPromiseResolve(writer) {
-  assert(writer._readyPromise_resolve !== undefined);
-  assert(writer._readyPromise_reject !== undefined);
+  assert(writer._readyPromise_resolve !== undefined, 'writer._readyPromise_resolve !== undefined');
+  assert(writer._readyPromise_reject !== undefined, 'writer._readyPromise_reject !== undefined');
 
   writer._readyPromise_resolve(undefined);
   writer._readyPromise_resolve = undefined;
   writer._readyPromise_reject = undefined;
+  writer._readyPromiseState = 'fulfilled';
 }
