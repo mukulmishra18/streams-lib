@@ -1,3 +1,4 @@
 node_modules/
 es5.1/
 streams.lib.bundle.js
+license-header.js

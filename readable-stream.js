@@ -1,18 +1,14 @@
 'use strict';
-const assert = require('assert');
 const { ArrayBufferCopy, CreateIterResultObject, IsFiniteNonNegativeNumber, InvokeOrNoop, PromiseInvokeOrNoop,
         TransferArrayBuffer, ValidateAndNormalizeQueuingStrategy, ValidateAndNormalizeHighWaterMark } =
       require('./helpers.js');
 const { createArrayFromList, createDataProperty, typeIsObject } = require('./helpers.js');
-const { rethrowAssertionErrorRejection } = require('./utils.js');
+const { assert, rethrowAssertionErrorRejection } = require('./utils.js');
 const { DequeueValue, EnqueueValueWithSize, ResetQueue } = require('./queue-with-sizes.js');
 const { AcquireWritableStreamDefaultWriter, IsWritableStream, IsWritableStreamLocked,
         WritableStreamAbort, WritableStreamDefaultWriterCloseWithErrorPropagation,
         WritableStreamDefaultWriterRelease, WritableStreamDefaultWriterWrite, WritableStreamCloseQueuedOrInFlight } =
       require('./writable-stream.js');
-
-const CancelSteps = Symbol('[[CancelSteps]]');
-const PullSteps = Symbol('[[PullSteps]]');
 
 class ReadableStream {
   constructor(underlyingSource = {}, { size, highWaterMark } = {}) {
@@ -491,7 +487,7 @@ function ReadableStreamCancel(stream, reason) {
 
   ReadableStreamClose(stream);
 
-  const sourceCancelPromise = stream._readableStreamController[CancelSteps](reason);
+  const sourceCancelPromise = stream._readableStreamController.__cancelSteps(reason);
   return sourceCancelPromise.then(() => undefined);
 }
 
@@ -507,7 +503,8 @@ function ReadableStreamClose(stream) {
   }
 
   if (IsReadableStreamDefaultReader(reader) === true) {
-    for (const { _resolve } of reader._readRequests) {
+    for (let i = 0; i < reader._readRequests.length; i++) {
+      const _resolve = reader._readRequests[i];
       _resolve(CreateIterResultObject(undefined, true));
     }
     reader._readRequests = [];
@@ -532,7 +529,8 @@ function ReadableStreamError(stream, e) {
   }
 
   if (IsReadableStreamDefaultReader(reader) === true) {
-    for (const readRequest of reader._readRequests) {
+    for (let i = 0; i < reader._readRequests.length; i++) {
+      const readRequest = reader._readRequests[i];
       readRequest._reject(e);
     }
 
@@ -540,7 +538,8 @@ function ReadableStreamError(stream, e) {
   } else {
     assert(IsReadableStreamBYOBReader(reader), 'reader must be ReadableStreamBYOBReader');
 
-    for (const readIntoRequest of reader._readIntoRequests) {
+    for (let i = 0; i < reader._readIntoRequests.length; i++) {
+      const readIntoRequest = reader._readIntoRequests[i];
       readIntoRequest._reject(e);
     }
 
@@ -848,7 +847,7 @@ function ReadableStreamDefaultReaderRead(reader) {
 
   assert(stream._state === 'readable');
 
-  return stream._readableStreamController[PullSteps]();
+  return stream._readableStreamController.__pullSteps();
 }
 
 // Controllers
@@ -956,12 +955,12 @@ class ReadableStreamDefaultController {
     ReadableStreamDefaultControllerError(this, e);
   }
 
-  [CancelSteps](reason) {
+  __cancelSteps(reason) {
     ResetQueue(this);
     return PromiseInvokeOrNoop(this._underlyingSource, 'cancel', [reason]);
   }
 
-  [PullSteps]() {
+  __pullSteps() {
     const stream = this._controlledReadableStream;
 
     if (this._queue.length > 0) {
@@ -1314,7 +1313,7 @@ class ReadableByteStreamController {
     ReadableByteStreamControllerError(this, e);
   }
 
-  [CancelSteps](reason) {
+  __cancelSteps(reason) {
     if (this._pendingPullIntos.length > 0) {
       const firstDescriptor = this._pendingPullIntos[0];
       firstDescriptor.bytesFilled = 0;
@@ -1325,7 +1324,7 @@ class ReadableByteStreamController {
     return PromiseInvokeOrNoop(this._underlyingByteSource, 'cancel', [reason]);
   }
 
-  [PullSteps]() {
+  __pullSteps() {
     const stream = this._controlledReadableStream;
     assert(ReadableStreamHasDefaultReader(stream) === true);
 

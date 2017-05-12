@@ -1,13 +1,8 @@
 'use strict';
-const assert = require('assert');
 const { InvokeOrNoop, PromiseInvokeOrNoop, ValidateAndNormalizeQueuingStrategy, typeIsObject } =
   require('./helpers.js');
-const { rethrowAssertionErrorRejection } = require('./utils.js');
+const { assert, rethrowAssertionErrorRejection } = require('./utils.js');
 const { DequeueValue, EnqueueValueWithSize, PeekQueueValue, ResetQueue } = require('./queue-with-sizes.js');
-
-const StartSteps = Symbol('[[StartSteps]]');
-const AbortSteps = Symbol('[[AbortSteps]]');
-const ErrorSteps = Symbol('[[ErrorSteps]]');
 
 class WritableStream {
   constructor(underlyingSink = {}, { size, highWaterMark = 1 } = {}) {
@@ -52,7 +47,7 @@ class WritableStream {
     }
 
     this._writableStreamController = new WritableStreamDefaultController(this, underlyingSink, size, highWaterMark);
-    this._writableStreamController[StartSteps]();
+    this._writableStreamController.__startSteps();
   }
 
   get locked() {
@@ -217,10 +212,11 @@ function WritableStreamFinishErroring(stream) {
   assert(WritableStreamHasOperationMarkedInFlight(stream) === false,
          'WritableStreamHasOperationMarkedInFlight(stream) === false');
   stream._state = 'errored';
-  stream._writableStreamController[ErrorSteps]();
+  stream._writableStreamController.__errorSteps();
 
   const storedError = stream._storedError;
-  for (const writeRequest of stream._writeRequests) {
+  for (let i = 0; i < stream._writeRequests.length; i++) {
+    const writeRequest = stream._writeRequests[i];
     writeRequest._reject(storedError);
   }
   stream._writeRequests = [];
@@ -239,7 +235,7 @@ function WritableStreamFinishErroring(stream) {
     return;
   }
 
-  const promise = stream._writableStreamController[AbortSteps](abortRequest._reason);
+  const promise = stream._writableStreamController.__abortSteps(abortRequest._reason);
   promise.then(
       () => {
         abortRequest._resolve();
@@ -706,15 +702,15 @@ class WritableStreamDefaultController {
     WritableStreamDefaultControllerError(this, e);
   }
 
-  [AbortSteps](reason) {
+  __abortSteps(reason) {
     return PromiseInvokeOrNoop(this._underlyingSink, 'abort', [reason]);
   }
 
-  [ErrorSteps]() {
+  __errorSteps() {
     ResetQueue(this);
   }
 
-  [StartSteps]() {
+  __startSteps() {
     const startResult = InvokeOrNoop(this._underlyingSink, 'start', [this]);
     const stream = this._controlledWritableStream;
 
