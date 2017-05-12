@@ -4,10 +4,6 @@ const { InvokeOrNoop, PromiseInvokeOrNoop, ValidateAndNormalizeQueuingStrategy, 
 const { assert, rethrowAssertionErrorRejection } = require('./utils.js');
 const { DequeueValue, EnqueueValueWithSize, PeekQueueValue, ResetQueue } = require('./queue-with-sizes.js');
 
-const StartSteps = "__startSteps";
-const AbortSteps = "__abortSteps";
-const ErrorSteps = "__errorSteps";
-
 class WritableStream {
   constructor(underlyingSink = {}, { size, highWaterMark = 1 } = {}) {
     this._state = 'writable';

@@ -11,14 +11,13 @@ function rethrowAssertionErrorRejection(e) {
   }
 };
 
-class AssertionError extends Error {
-  constructor(message) {
-    super(message);
-    this.message = message || '';
-    this.name = 'AssertionError';
-    this.stack = (new Error()).stack;
-  }
+function AssertionError(message) {
+  this.name = 'AssertionError';
+  this.message = message || '';
+  this.stack = (new Error()).stack;
 }
+AssertionError.prototype = Object.create(Error.prototype);
+AssertionError.prototype.constructor = AssertionError;
 
 function assert (value, message) {
   if (!value) {

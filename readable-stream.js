@@ -10,9 +10,6 @@ const { AcquireWritableStreamDefaultWriter, IsWritableStream, IsWritableStreamLo
         WritableStreamDefaultWriterRelease, WritableStreamDefaultWriterWrite, WritableStreamCloseQueuedOrInFlight } =
       require('./writable-stream.js');
 
-const CancelSteps = "__cancelStep";
-const PullSteps = "__pullStep";
-
 class ReadableStream {
   constructor(underlyingSource = {}, { size, highWaterMark } = {}) {
     // Exposed to controllers.
@@ -506,7 +503,7 @@ function ReadableStreamClose(stream) {
   }
 
   if (IsReadableStreamDefaultReader(reader) === true) {
-    for (let  i = 0; i < reader._readRequests.length; i++) {
+    for (let i = 0; i < reader._readRequests.length; i++) {
       const _resolve = reader._readRequests[i];
       _resolve(CreateIterResultObject(undefined, true));
     }
